@@ -2,7 +2,7 @@
 
 set -x
 
-MODEL_PATH=Qwen/Qwen2.5-VL-32B-Instruct  # replace it with your local file path
+MODEL_PATH=Qwen/Qwen3-VL-30B-A3B-Instruct  # replace it with your local file path
 
 python3 -m verl.trainer.main \
     config=examples/config.yaml \
@@ -12,5 +12,5 @@ python3 -m verl.trainer.main \
     worker.actor.fsdp.torch_dtype=bf16 \
     worker.actor.optim.strategy=adamw_bf16 \
     worker.rollout.tensor_parallel_size=8 \
-    trainer.experiment_name=qwen2_5_vl_32b_geo_grpo \
+    trainer.experiment_name=qwen3_vl_30b_geo_grpo \
     trainer.n_gpus_per_node=8

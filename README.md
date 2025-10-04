@@ -13,7 +13,7 @@ EasyR1 is efficient and scalable due to the design of **[HybirdEngine](https://a
 
 - Supported models
   - Llama3/Qwen2/Qwen2.5/Qwen3 language models
-  - Qwen2/Qwen2.5-VL vision language models
+  - Qwen2-VL/Qwen2.5-VL/Qwen3-VL vision language models
   - DeepSeek-R1 distill models
 
 - Supported algorithms
@@ -45,14 +45,14 @@ We provide a [Dockerfile](./Dockerfile) to easily build environments.
 We recommend using the [pre-built docker image](https://hub.docker.com/r/hiyouga/verl) in EasyR1.
 
 ```bash
-docker pull hiyouga/verl:ngc-th2.7.1-cu12.6-vllm0.10.0
-docker run -it --ipc=host --gpus=all hiyouga/verl:ngc-th2.7.1-cu12.6-vllm0.10.0
+docker pull hiyouga/verl:ngc-th2.8.0-cu12.9-vllm0.11.0
+docker run -it --ipc=host --gpus=all hiyouga/verl:ngc-th2.8.0-cu12.9-vllm0.11.0
 ```
 
 If your environment does not support Docker, you can consider using **Apptainer**:
 
 ```bash
-apptainer pull easyr1.sif docker://hiyouga/verl:ngc-th2.7.1-cu12.6-vllm0.10.0
+apptainer pull easyr1.sif docker://hiyouga/verl:ngc-th2.8.0-cu12.9-vllm0.11.0
 apptainer shell --nv --cleanenv --bind /mnt/your_dir:/mnt/your_dir easyr1.sif
 ```
 
