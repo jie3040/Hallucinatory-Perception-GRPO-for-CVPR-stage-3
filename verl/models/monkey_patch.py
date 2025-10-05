@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..utils.py_functional import is_transformers_version_greater_than
 from .transformers.flash_attention_utils import flash_attention_forward
-from .transformers.qwen2_vl import qwen2_vl_base_forward, qwen2_vl_model_forward
 
 
 SUPPORTED_MODEL_TYPE = (
@@ -55,6 +53,8 @@ def apply_ulysses_patch(model_type: str) -> None:
         )
         from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration, Qwen2VLModel
 
+        from .transformers.qwen2_vl import qwen2_vl_base_forward, qwen2_vl_model_forward
+
         # fix text-image mixed data
         Qwen2VLModel.forward = qwen2_vl_base_forward
         Qwen2_5_VLModel.forward = qwen2_vl_base_forward
@@ -63,8 +63,16 @@ def apply_ulysses_patch(model_type: str) -> None:
         Qwen2_5_VLForConditionalGeneration.forward = qwen2_vl_model_forward
     elif model_type in QWEN3_VL_MODELS:
         from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3VLModel
+        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+            Qwen3VLMoeForConditionalGeneration,
+            Qwen3VLMoeModel,
+        )
+
+        from .transformers.qwen3_vl import qwen3_vl_base_forward, qwen3_vl_model_forward
 
         # fix text-image mixed data
-        Qwen3VLModel.forward = qwen2_vl_base_forward
+        Qwen3VLModel.forward = qwen3_vl_base_forward
+        Qwen3VLMoeModel.forward = qwen3_vl_base_forward
         # TODO: add linear cross entropy kernels
-        Qwen3VLForConditionalGeneration.forward = qwen2_vl_model_forward
+        Qwen3VLForConditionalGeneration.forward = qwen3_vl_model_forward
+        Qwen3VLMoeForConditionalGeneration.forward = qwen3_vl_model_forward
