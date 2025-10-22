@@ -14,10 +14,10 @@
 
 import json
 
-import ray
-from omegaconf import OmegaConf
+import ray # Ray 分布式计算框架，用于多节点多 GPU 训练
+from omegaconf import OmegaConf  # 配置管理工具，支持 YAML 和命令行参数合并
 
-from ..single_controller.ray import RayWorkerGroup
+from ..single_controller.ray import RayWorkerGroup # Ray Worker 管理组
 from ..utils.tokenizer import get_processor, get_tokenizer
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import BatchFunctionRewardManager, SequentialFunctionRewardManager
@@ -37,11 +37,15 @@ class Runner:
 
         # instantiate tokenizer
         tokenizer = get_tokenizer(
-            config.worker.actor.model.model_path,
-            override_chat_template=config.data.override_chat_template,
-            trust_remote_code=config.worker.actor.model.trust_remote_code,
-            use_fast=True,
+            config.worker.actor.model.model_path,  # 模型路径
+            override_chat_template=config.data.override_chat_template, # 是否覆盖聊天模板
+            trust_remote_code=config.worker.actor.model.trust_remote_code, # 是否信任远程代码
+            use_fast=True, # 使用快速分词器（Rust 实现）
         )
+
+        # processor: 用于多模态模型的处理器（如 Qwen2.5-VL）
+        # 包含 tokenizer + image_processor
+        
         processor = get_processor(
             config.worker.actor.model.model_path,
             override_chat_template=config.data.override_chat_template,
@@ -49,8 +53,12 @@ class Runner:
             use_fast=True,
         )
 
+        # ========== 3. 定义 Worker 类和资源分配 ==========
+        # Ray Worker Group: 管理所有分布式 Worker 的类
+
         # define worker classes
         ray_worker_group_cls = RayWorkerGroup
+        
         role_worker_mapping = {
             Role.ActorRolloutRef: ray.remote(FSDPWorker),
             Role.Critic: ray.remote(FSDPWorker),
@@ -65,6 +73,11 @@ class Runner:
         }
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
+        # ========== 5. 初始化 Reward Manager ==========
+        # 奖励函数有两种类型：
+        # - sequential: 逐个序列计算奖励（适合复杂奖励函数）
+        # - batch: 批量计算奖励（速度更快）
+
         if config.worker.reward.reward_type == "sequential":
             RewardManager = SequentialFunctionRewardManager
         elif config.worker.reward.reward_type == "batch":
@@ -73,8 +86,13 @@ class Runner:
             raise NotImplementedError(f"Unknown reward type {config.worker.reward.reward_type}.")
 
         RemoteRewardManager = ray.remote(RewardManager).options(num_cpus=config.worker.reward.num_cpus)
+
+        # 训练集的奖励函数实例
         reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
+        # 验证集的奖励函数实例
         val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
+
+        # ========== 6. 创建数据加载器 ==========
 
         train_dataloader, val_dataloader = create_dataloader(config.data, tokenizer, processor)
 
@@ -93,6 +111,9 @@ class Runner:
         trainer.init_workers()
         trainer.fit()
 
+# ============================================================
+# main 函数：程序入口
+# ============================================================
 
 def main():
     cli_args = OmegaConf.from_cli()

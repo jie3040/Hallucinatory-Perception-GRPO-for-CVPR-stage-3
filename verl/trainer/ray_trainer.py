@@ -65,14 +65,19 @@ class Role(IntEnum):
     """
     To create more roles dynamically, you can subclass Role and add new members
     """
+    """
+    训练过程中的角色定义
+    每个角色代表一个模型或模型的一个用途
+    """
+    
 
-    Actor = auto()
-    Rollout = auto()
-    ActorRollout = auto()
-    Critic = auto()
-    RefPolicy = auto()
-    RewardModel = auto()
-    ActorRolloutRef = auto()
+    Actor = auto() # 策略模型（被训练）
+    Rollout = auto() # 用于采样的模型
+    ActorRollout = auto() # Actor 和 Rollout 合并
+    Critic = auto() # 价值函数模型
+    RefPolicy = auto() # 参考策略（用于 KL 散度）
+    RewardModel = auto() # 奖励模型
+    ActorRolloutRef = auto() # Actor + Rollout + Reference 三合一
 
 
 @dataclass
@@ -80,6 +85,12 @@ class ResourcePoolManager:
     """
     Define a resource pool specification. Resource pool will be initialized first.
     """
+    """
+    管理 GPU 资源池的分配
+    - 定义每个节点有多少 GPU
+    - 将不同角色映射到不同的资源池
+    """
+    
 
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[Role, str]
@@ -113,29 +124,84 @@ class ResourcePoolManager:
         if gpus_available < gpus_required:
             raise ValueError(f"Total available GPUs {gpus_available} is less than total desired GPUs {gpus_required}.")
 
+# ============================================================
+# ⭐⭐⭐ apply_kl_penalty：应用 KL 惩罚到 Reward
+# 这是 Reward 计算的核心函数之一
+# ============================================================
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: KLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards."""
+
+    """
+    应用 KL 散度惩罚到 token 级别的奖励
+    
+    公式：token_level_rewards = token_level_scores - kl_coef * KL(π_θ || π_ref)
+    
+    参数：
+        data: 包含所有训练数据的协议对象
+        kl_ctrl: KL 控制器，动态调整 kl_coef
+        kl_penalty: KL 惩罚类型（'kl', 'abs', 'mse'）
+    
+    作用：
+        防止策略模型偏离参考模型太远，保持训练稳定性
+    """
+
+    # 获取原始奖励分数（来自奖励函数）
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
     response_mask = data.batch["response_mask"]
 
+    # ⭐ 计算 KL 散度：当前策略 vs 参考策略
+    # old_log_probs: 当前策略的对数概率
+    # ref_log_probs: 参考策略的对数概率
+    
     # compute kl between ref_policy and current policy
     kld = compute_kl(data.batch["old_log_probs"], data.batch["ref_log_probs"], kl_penalty=kl_penalty)
     kld = kld * response_mask  # (batch_size, response_length)
 
+    # ⭐⭐⭐ 核心公式：最终的 token 级别奖励
+    # reward = 原始分数 - KL系数 * KL散度
     data.batch["token_level_rewards"] = token_level_scores - kl_ctrl.kl_coef * kld
 
     current_kl = torch.mean(VF.masked_mean(kld, mask=response_mask, dim=-1)).item()
     metrics = {"actor/kl_penalty": current_kl, "actor/kl_coef": kl_ctrl.kl_coef}
 
     # According to https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/ppo_trainer.py#L880
+
+    # 动态更新 KL 系数（自适应控制）
+    # 根据当前 KL 值调整系数，防止过度偏离
+    
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
     return data, metrics
 
+# ============================================================
+# ⭐⭐⭐ compute_advantage：计算优势函数
+# 这是 Loss 计算的核心函数之一
+# ============================================================
 
 def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma: float = 1.0, lam: float = 1.0):
     """Compute advantage estimates for policy optimization."""
+    
+    """
+    计算优势函数（Advantage）和回报（Return）
+    
+    优势函数 A(s,a) = Q(s,a) - V(s)
+    表示在状态 s 下采取动作 a 比平均好多少
+    
+    支持的估计器：
+        - GAE (Generalized Advantage Estimation): 需要 Critic
+        - GRPO (Group Relative Policy Optimization): 组内相对优势
+        - RLOO (REINFORCE Leave-One-Out): 留一法基线
+        - ReMax: 使用贪心解码作为基线
+    
+    参数：
+        data: 包含 rewards, values, baselines 等信息
+        adv_estimator: 优势估计器类型
+        gamma: 折扣因子
+        lam: GAE 的 λ 参数
+    """
+    
+    
     adv_inputs = {
         "token_level_rewards": data.batch["token_level_rewards"],
         "response_mask": data.batch["response_mask"],
@@ -143,22 +209,38 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
         "gamma": gamma,
         "lam": lam,
     }
+    # 如果使用 Critic，添加价值函数预测
     if "values" in data.batch:
         adv_inputs["values"] = data.batch["values"]
-
+        
+    # 如果使用 ReMax，添加基线奖励
     if "reward_baselines" in data.batch:
         adv_inputs["reward_baselines"] = data.batch["reward_baselines"]
+
+    # ⭐ 计算优势和回报
+    # advantages: 用于策略梯度
+    # returns: 用于 Critic 训练
 
     advantages, returns = compute_advantage_return(adv_estimator, **adv_inputs)
     data.batch["advantages"] = advantages
     data.batch["returns"] = returns
     return data
 
+# ============================================================
+# RayPPOTrainer：主训练器类
+# ============================================================
 
 class RayPPOTrainer:
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+
+    """
+    基于 Ray 的 PPO/GRPO 训练器
+    
+    运行在驱动进程上，协调所有分布式 Worker 的工作
+    """
+    
 
     def __init__(
         self,
@@ -173,6 +255,26 @@ class RayPPOTrainer:
         reward_fn: Optional[FunctionRewardManager] = None,
         val_reward_fn: Optional[FunctionRewardManager] = None,
     ):
+
+
+        """
+        初始化训练器
+        
+        参数：
+            config: 训练配置
+            tokenizer: 分词器
+            processor: 多模态处理器
+            train_dataloader: 训练数据加载器
+            val_dataloader: 验证数据加载器
+            role_worker_mapping: 角色到 Worker 类的映射
+            resource_pool_manager: GPU 资源管理器
+            ray_worker_group_cls: Ray Worker Group 类
+            reward_fn: 训练奖励函数
+            val_reward_fn: 验证奖励函数
+        """
+
+
+        
         self.tokenizer = tokenizer
         self.processor = processor
         self.train_dataloader = train_dataloader
@@ -192,6 +294,7 @@ class RayPPOTrainer:
         self.ray_worker_group_cls = ray_worker_group_cls
 
         # define KL control
+        # ========== KL 控制设置 ==========
         if config.algorithm.disable_kl:
             self.use_reference_policy = False
             self.kl_ctrl = FixedKLController(init_kl_coef=0.0)
@@ -200,6 +303,8 @@ class RayPPOTrainer:
             self.use_reference_policy = True
             self.kl_ctrl = get_kl_controller(config.algorithm)
 
+        
+        # ========== 优势估计器设置 ==========
         if config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
         else:
@@ -208,6 +313,11 @@ class RayPPOTrainer:
         if config.algorithm.adv_estimator not in list(AdvantageEstimator):
             raise NotImplementedError(f"Unknown advantage estimator: {config.algorithm.adv_estimator}.")
 
+
+        # ========== 批次大小验证 ==========
+        # 确保 rollout_batch_size 可以被 actor global_batch_size 整除
+
+        
         if config.data.rollout_batch_size % config.worker.actor.global_batch_size != 0:
             raise ValueError("Rollout batch size must be divisible by actor global batch size.")
 
@@ -229,31 +339,53 @@ class RayPPOTrainer:
                     "Rollout batch size * rollout.n must be divisible by critic micro batch size for experience."
                 )
 
+        # ========== GRPO/RLOO 验证 ==========
+        # GRPO 和 RLOO 需要每个 prompt 生成多个响应（n > 1）
+        
         if (
             config.algorithm.adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.RLOO)
             and config.worker.rollout.n == 1
         ):
             raise ValueError("GRPO and RLOO algorithm need `config.worker.rollout.n > 1`.")
 
+
+        # ========== 计算训练步数 ==========
         if config.trainer.max_steps is not None:
+            # 手动指定最大步数
             self.training_steps = config.trainer.max_steps
         elif config.data.mini_rollout_batch_size is not None:
+            # 根据数据集大小计算
             num_examples = len(train_dataloader) * config.data.mini_rollout_batch_size
             self.training_steps = num_examples // config.data.rollout_batch_size * config.trainer.total_epochs
         else:
+            # 根据 dataloader 长度计算
             self.training_steps = len(train_dataloader) * config.trainer.total_epochs
 
         config.worker.actor.optim.training_steps = self.training_steps
         config.worker.critic.optim.training_steps = self.training_steps
         print(f"Total training steps: {self.training_steps}")
 
+    # ========== 初始化 Workers ==========
     def init_workers(self) -> None:
         """Init resource pool and worker group"""
+
+        """
+        初始化资源池和 Worker Group
+        
+        步骤：
+        1. 创建资源池
+        2. 定义 Worker 类和资源映射
+        3. 初始化各个 Worker（Actor, Critic, Reward Model）
+        """
+        
         self.resource_pool_manager.create_resource_pool()
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor, rollout and ref
         if self.hybrid_engine:
+            
+            # Hybrid Engine 模式：三个角色共享一个 Worker
+            
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRolloutRef)
             actor_rollout_ref_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRolloutRef], config=self.config.worker, role="actor_rollout_ref"
@@ -390,6 +522,17 @@ class RayPPOTrainer:
         self.logger.log_generation(samples, self.global_step)
 
     def _validate(self) -> dict[str, Any]:
+
+        """
+        在验证集上评估模型
+        
+        步骤：
+        1. 生成验证样本
+        2. 计算奖励分数
+        3. 收集指标和样本
+        4. 记录生成结果
+        """
+        
         reward_tensor_lst = []
         # Lists to collect samples for the table
         sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
@@ -463,7 +606,24 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    # ========== 构建训练批次 ==========
+
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
+
+        """
+        构建一个训练批次
+        
+        步骤：
+        1. 从 DataLoader 获取数据
+        2. 使用 Actor 生成响应
+        3. 可选：在线过滤（根据奖励分数过滤低质量样本）
+        4. 可选：ReMax 基线计算
+        5. 重复样本以匹配 rollout.n
+        
+        返回：
+            包含 prompt + response 的完整批次
+        """
+        
         batch = None
         all_metrics = defaultdict(list)
         num_try_make_batch = 0
@@ -494,6 +654,8 @@ class RayPPOTrainer:
             )
 
             # generate a batch
+            # ⭐⭐⭐ 生成响应（核心步骤）
+            
             gen_batch_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
 
             if self.config.algorithm.adv_estimator == "remax":
@@ -510,6 +672,9 @@ class RayPPOTrainer:
                 new_batch.batch["reward_baselines"] = reward_baseline_tensor
                 del gen_baseline_batch, gen_baseline_output
 
+            # ========== 重复样本以匹配 rollout.n ==========
+            # 例如：rollout.n=4，则每个 prompt 会生成 4 个不同的响应
+            
             # repeat to align with repeated responses in rollout
             new_batch = new_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
             new_batch = new_batch.union(gen_batch_output)
@@ -558,12 +723,34 @@ class RayPPOTrainer:
 
                 return batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
 
+    # ============================================================
+    # ⭐⭐⭐ fit()：主训练循环
+    # 这是整个训练的核心，协调所有组件
+    # ============================================================
+    
     def fit(self):
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+
+        """
+        PPO/GRPO 的训练循环
+        
+        驱动进程通过 RPC 调用 Worker Group 的计算函数来构建 PPO 数据流
+        轻量级的优势计算在驱动进程上完成
+        
+        训练流程：
+        1. 生成响应（Rollout）
+        2. 计算奖励（Reward Function）
+        3. 计算 KL 散度（Reference Policy）
+        4. 计算价值（Critic）
+        5. 计算优势（Advantage）
+        6. 更新 Critic（Value Function）
+        7. 更新 Actor（Policy）
+        """
+        
         self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())
         self.global_step = 0
         main_tqdm = tqdm(range(self.training_steps), desc="Running step", position=0)
@@ -588,6 +775,7 @@ class RayPPOTrainer:
             metrics, timing_raw = {}, {}
             with timer("step", timing_raw):
                 # make a batch of data
+                # ========== 步骤 1：生成批次数据 ==========
                 with timer("gen", timing_raw):
                     self.actor_rollout_ref_wg.prepare_rollout_engine()
                     batch = self._make_batch_data(metrics=metrics)
@@ -599,6 +787,7 @@ class RayPPOTrainer:
                 self._balance_batch(batch, metrics=metrics)
 
                 # compute global valid tokens
+                # 计算全局有效 token 数量
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                 # compute reward
@@ -607,11 +796,15 @@ class RayPPOTrainer:
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
                 # recompute old_log_probs
+                # ========== 步骤 4：重新计算 old_log_probs ==========
+                # 为什么要重新计算？
+                # 因为生成时的模型可能与当前训练的模型不完全同步
                 with timer("old", timing_raw):
                     old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
                     batch = batch.union(old_log_probs)
 
                 # compute ref_log_probs
+                # 使用参考策略计算对数概率（用于 KL 散度）
                 if self.use_reference_policy:
                     with timer("ref", timing_raw):
                         ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
@@ -632,6 +825,7 @@ class RayPPOTrainer:
                         metrics.update(reward_metrics)
 
                     # apply kl penalty if available
+                    # ⭐⭐⭐ 应用 KL 惩罚到奖励
                     if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
                         # apply kl penalty to reward
                         batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
@@ -701,3 +895,70 @@ class RayPPOTrainer:
 
         if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
             self._save_checkpoint()
+
+"""
+=============================================================================
+核心训练流程总结
+=============================================================================
+
+fit() 方法的每一步：
+
+1. 生成阶段（Generation）
+   └─> _make_batch_data()
+       ├─> 从 DataLoader 获取 prompts
+       ├─> Actor 生成 n 个响应
+       ├─> 可选：在线过滤低质量样本
+       └─> 返回完整的 (prompt, response) 批次
+
+2. 负载均衡（Load Balancing）
+   └─> _balance_batch()
+       └─> 重新排序数据，确保每个 GPU 处理相似数量的 tokens
+
+3. 奖励计算（Reward Computation）
+   └─> reward_fn.compute_reward()
+       └─> 返回 token 级别的奖励分数
+
+4. 对数概率计算（Log Probabilities）
+   ├─> compute_log_probs(): 当前策略的对数概率
+   └─> compute_ref_log_probs(): 参考策略的对数概率（用于 KL）
+
+5. 价值计算（Value Function）
+   └─> critic_wg.compute_values()
+       └─> 返回状态价值估计（仅 GAE 需要）
+
+6. 优势计算（Advantage Estimation）
+   ├─> apply_kl_penalty(): 应用 KL 惩罚
+   │   └─> reward = score - kl_coef * KL(π || π_ref)
+   └─> compute_advantage(): 计算优势函数
+       ├─> GAE: A = Σ (γλ)^t δ_t
+       ├─> GRPO: A = r - mean(r_group)
+       ├─> RLOO: A = r - mean(r_others)
+       └─> ReMax: A = r - r_greedy
+
+7. 模型更新（Model Updates）
+   ├─> update_critic(): 更新价值函数
+   │   └─> Loss = MSE(V(s), returns)
+   └─> update_actor(): 更新策略
+       └─> Loss = -E[A * log π(a|s)] + KL_loss
+
+=============================================================================
+Reward 和 Loss 的关键位置
+=============================================================================
+
+⭐ Reward 计算路径：
+1. reward_fn.compute_reward() → verl/workers/reward.py
+2. apply_kl_penalty() → 当前文件 ray_trainer.py
+3. compute_advantage() → 当前文件 + verl/trainer/core_algos.py
+
+⭐ Loss 计算路径：
+1. update_critic() → verl/workers/fsdp_workers.py
+2. update_actor() → verl/workers/fsdp_workers.py
+3. 具体 loss 公式 → verl/algorithm/ 目录
+
+要修改 Reward 或 Loss，你需要查看：
+- verl/workers/reward.py（自定义奖励函数）
+- verl/trainer/core_algos.py（优势估计算法）
+- verl/workers/fsdp_workers.py（Actor 和 Critic 的更新逻辑）
+- verl/algorithm/（PPO/GRPO 的 loss 公式）
+"""
+

@@ -28,19 +28,22 @@ from .config import RewardConfig
 
 
 class RewardInput(TypedDict):
-    response: str
-    response_length: int
-    ground_truth: str
+    """传递给 reward 函数的输入数据结构"""
+    response: str        # 模型生成的响应文本
+    response_length: int  # 响应的 token 长度
+    ground_truth: str      # 标准答案/真实标签
 
 
 class RewardScore(TypedDict):
-    overall: float
-    format: Optional[float]
-    accuracy: Optional[float]
+    overall: float     # 总体奖励分数（必须有）
+    format: Optional[float]   # 格式分数（可选）
+    accuracy: Optional[float]   # 准确性分数（可选）
+    # 可以根据需求添加更多维度的分数
 
-
+# 顺序处理：每次处理一个样本
 SequentialRewardFunction = Callable[[RewardInput], RewardScore]
 
+# 批量处理：一次处理多个样本，效率更高
 BatchRewardFunction = Callable[[list[RewardInput]], list[RewardScore]]
 
 
@@ -78,19 +81,38 @@ class FunctionRewardManager(ABC):
 
 
 class SequentialFunctionRewardManager(FunctionRewardManager):
+    """顺序处理每个样本的 reward manager"""
     reward_fn: SequentialRewardFunction
 
     def compute_reward(self, data: DataProto) -> Tuple[torch.Tensor, dict[str, list[float]]]:
+        
+        # 初始化 reward tensor，shape: [batch_size, seq_len]
+        # 默认全为 0，只在响应的最后一个 token 位置填充实际 reward
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+
+        
         reward_metrics = defaultdict(list)
         response_ids = data.batch["responses"]
+
+        # 计算每个样本的有效响应长度（非 padding 部分）
+        # response_mask 中 1 表示有效 token，0 表示 padding
         response_length = torch.sum(data.batch["response_mask"], dim=-1)
+        
         for i in range(len(data)):
+            
+            # 获取当前样本的响应长度，转为 Python int 避免 tensor 索引错误
             cur_response_length = int(response_length[i].item())  # avoid tensor indexing error
+
+            # 截取有效的响应 token（去除 padding）
             valid_response_ids = response_ids[i][:cur_response_length]
+
+            # 将 token ids 解码为文本
+            # skip_special_tokens: 是否跳过特殊 token（如 [PAD], [EOS]）
             response_str = self.tokenizer.decode(
                 valid_response_ids, skip_special_tokens=self.config.skip_special_tokens
             )
+
+            # 调用自定义 reward 函数计算分数
             score = self.reward_fn(
                 {
                     "response": response_str,
@@ -98,7 +120,12 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                     "ground_truth": data.non_tensor_batch["ground_truth"][i],
                 }
             )
+
+            # ⚠️ 关键：将 overall 分数放在响应的最后一个 token 位置
+            # 这是因为 GRPO 只在序列结束时给予 reward
             reward_tensor[i, cur_response_length - 1] = score["overall"]
+
+            # 收集所有维度的分数用于监控
             for key, value in score.items():
                 reward_metrics[key].append(value)
 
