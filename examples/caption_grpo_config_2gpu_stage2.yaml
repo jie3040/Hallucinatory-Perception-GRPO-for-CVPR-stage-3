@@ -1,0 +1,108 @@
+# Flickr30k Caption GRPO Stage 2 - 模型自评奖励（保守配置）
+data:
+  train_files: /root/autodl-tmp/flickr30k_easyr1/train
+  val_files: /root/autodl-tmp/flickr30k_easyr1/val
+  prompt_key: prompt
+  answer_key: caption
+  image_key: images
+  video_key: videos
+  image_dir: null
+  video_fps: 2.0
+  max_prompt_length: 512
+  max_response_length: 256
+  rollout_batch_size: 16  # 降低：64 -> 16（因为要运行额外的评分模型）
+  mini_rollout_batch_size: null
+  val_batch_size: 32      # 降低：128 -> 32
+  format_prompt: null
+  override_chat_template: null
+  shuffle: true
+  seed: 42
+  min_pixels: 262144
+  max_pixels: 4194304
+  filter_overlong_prompts: true
+
+algorithm:
+  adv_estimator: grpo
+  disable_kl: false
+  use_kl_loss: true
+  kl_penalty: low_var_kl
+  kl_coef: 1.0e-2
+  online_filtering: false
+  filter_key: overall
+  filter_low: 0.01
+  filter_high: 0.99
+
+worker:
+  actor:
+    global_batch_size: 8   # 降低：32 -> 8
+    micro_batch_size_per_device_for_update: 1   # 降低：2 -> 1
+    micro_batch_size_per_device_for_experience: 2  # 降低：4 -> 2
+    max_grad_norm: 1.0
+    padding_free: true
+    dynamic_batching: true
+    ulysses_size: 1
+    model:
+      model_path: /root/autodl-tmp/models/Qwen/Qwen2-VL-2B-Instruct
+      enable_gradient_checkpointing: true
+      trust_remote_code: true
+      freeze_vision_tower: false
+    optim:
+      lr: 5.0e-7           # 降低学习率（第二阶段微调）
+      weight_decay: 1.0e-2
+      strategy: adamw
+      lr_warmup_ratio: 0.1
+    fsdp:
+      enable_full_shard: true
+      enable_cpu_offload: false
+      enable_rank0_init: true
+    offload:
+      offload_params: false
+      offload_optimizer: false
+
+  rollout:
+    n: 2                   # 降低：4 -> 2（减少生成候选数）
+    temperature: 0.8
+    top_p: 0.9
+    limit_images: 0
+    gpu_memory_utilization: 0.35  # 降低：0.4 -> 0.35（给评分模型留空间）
+    enforce_eager: false
+    enable_chunked_prefill: false
+    tensor_parallel_size: 2
+    disable_tqdm: false
+    val_override_config:
+      temperature: 0.7
+      top_p: 0.9
+      n: 1
+
+  ref:
+    fsdp:
+      enable_full_shard: true
+      enable_cpu_offload: false
+      enable_rank0_init: true
+    offload:
+      offload_params: false
+
+  reward:
+    reward_type: batch
+    reward_function: ./examples/reward_function/self_eval_reward_lazy.py:compute_score  # 新的模型自评奖励
+
+trainer:
+  total_epochs: 2          # 降低：3 -> 2（第二阶段不需要太多epoch）
+  max_steps: null
+  project_name: easy_r1
+  experiment_name: flickr30k_caption_grpo_2x3090_stage2  # 新实验名
+  logger: ["file"]         # 修改：移除 wandb
+  nnodes: 1
+  n_gpus_per_node: 2
+  max_try_make_batch: 20
+  val_freq: 1
+  val_before_train: true
+  val_only: false
+  val_generations_to_log: 5
+  save_freq: 1
+  save_limit: 3
+  save_model_only: false
+  save_checkpoint_path: null
+  load_checkpoint_path: /root/autodl-tmp/EasyR1/checkpoints/easy_r1/flickr30k_caption_grpo_2x3090/epoch_2  # 从第一阶段加载
+  find_last_checkpoint: true
+
